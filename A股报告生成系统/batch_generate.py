@@ -4,8 +4,8 @@ import re
 import time
 import json
 import signal
+import argparse
 from datetime import datetime, timedelta
-from pathlib import Path
 
 # 添加src目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -98,8 +98,15 @@ def get_stock_name_improved(fetcher, stock_code, max_retries=3):
             # 方法2：从get_stock_basic_info获取
             stock_info = fetcher.get_stock_basic_info(stock_code)
             if stock_info and 'individual_info' in stock_info:
-                items = stock_info['individual_info'].get('item', [])
-                values = stock_info['individual_info'].get('value', [])
+                individual_info = stock_info['individual_info']
+                if 'items' in individual_info and isinstance(individual_info['items'], dict):
+                    for key in ('股票简称', '名称', '股票名称'):
+                        name = individual_info['items'].get(key)
+                        if name:
+                            return str(name)
+
+                items = individual_info.get('item', [])
+                values = individual_info.get('value', [])
                 # 查找'股票简称'对应的值
                 for i, item in enumerate(items):
                     if '股票简称' in str(item) or '名称' in str(item):
@@ -120,8 +127,24 @@ def get_stock_name_improved(fetcher, stock_code, max_retries=3):
     return stock_code
 
 
+def parse_args():
+    """解析批量生成参数"""
+    parser = argparse.ArgumentParser(description="A股研究报告批量生成")
+    parser.add_argument("--stock-file", default=None, help="股票代码文件，默认 data/stocks_code.txt")
+    parser.add_argument("--output-dir", default=None, help="报告输出目录，默认 output/")
+    parser.add_argument("--limit", type=int, default=None, help="本次最多处理多少只股票")
+    parser.add_argument("--start-from", default=None, help="从指定股票代码开始处理")
+    parser.add_argument("--retry-failed", action="store_true", help="重新尝试已失败3次以上的股票")
+    parser.add_argument("--dry-run", action="store_true", help="不调用DashScope API，用模拟内容验证流程")
+    parser.add_argument("--no-rag", action="store_true", help="禁用本地知识库检索")
+    parser.add_argument("--knowledge-base", default=None, help="知识库目录，默认 knowledge_base/")
+    parser.add_argument("--rag-top-k", type=int, default=6, help="RAG最多注入的资料片段数")
+    return parser.parse_args()
+
+
 def main():
     global should_exit
+    args = parse_args()
 
     # 注册信号处理器
     signal.signal(signal.SIGINT, signal_handler)
@@ -133,9 +156,11 @@ def main():
     load_dotenv(env_file)
 
     api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
+    if not api_key and not args.dry_run:
         print("错误：未找到DASHSCOPE_API_KEY，请检查config/.env文件")
         return
+    if args.dry_run and not api_key:
+        api_key = "dry-run"
 
     # 初始化生成器
     print("=" * 60)
@@ -144,13 +169,19 @@ def main():
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     print("\n正在初始化...")
-    generator = ResearchReportGenerator(api_key=api_key)
+    generator = ResearchReportGenerator(
+        api_key=api_key,
+        knowledge_base_dir=args.knowledge_base,
+        rag_enabled=not args.no_rag,
+        rag_top_k=args.rag_top_k,
+        dry_run=args.dry_run,
+    )
     fetcher = StockDataFetcher()
 
     # 读取股票列表
     print("\n正在读取股票列表...")
     data_dir = os.path.join(os.path.dirname(__file__), 'data')
-    stock_file = os.path.join(data_dir, 'stocks_code.txt')
+    stock_file = args.stock_file or os.path.join(data_dir, 'stocks_code.txt')
 
     if not os.path.exists(stock_file):
         print(f"错误：找不到股票列表文件 {stock_file}")
@@ -160,7 +191,15 @@ def main():
         lines = f.readlines()
 
     # 过滤出股票代码（跳过注释行）
-    stock_list = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
+    stock_list = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith('#')]
+    if not stock_list:
+        print("错误：股票列表为空，请在 data/stocks_code.txt 中添加6位股票代码")
+        return
+
+    invalid_codes = [code for code in stock_list if not code.isdigit() or len(code) != 6]
+    if invalid_codes:
+        print(f"错误：股票代码格式无效: {', '.join(invalid_codes[:10])}")
+        return
 
     # 加载失败股票记录
     failed_stocks = load_failed_stocks(data_dir)
@@ -171,20 +210,36 @@ def main():
     progress = load_progress(data_dir)
     start_index = progress.get('current_index', 0)
 
+    if args.start_from:
+        if args.start_from not in stock_list:
+            print(f"错误：--start-from 指定的股票代码不在列表中: {args.start_from}")
+            return
+        start_index = stock_list.index(args.start_from)
+
     if start_index > 0:
         print(f"从第 {start_index + 1} 个股票继续...")
 
+    end_index = len(stock_list)
+    if args.limit is not None:
+        if args.limit <= 0:
+            print("错误：--limit 必须大于0")
+            return
+        end_index = min(start_index + args.limit, len(stock_list))
+
     # 获取已生成的文件
-    output_dir = os.path.join(os.path.dirname(__file__), 'output')
+    output_dir = args.output_dir or os.path.join(os.path.dirname(__file__), 'output')
     os.makedirs(output_dir, exist_ok=True)
     generated_files = get_generated_files(output_dir)
     print(f"已发现 {len(generated_files)} 个已生成文件，将自动跳过")
 
     # 设置输出目录
-    print(f"\n待生成股票数: {len(stock_list)}")
-    print(f"从: {stock_list[0] if stock_list else 'N/A'}")
-    print(f"到: {stock_list[-1] if stock_list else 'N/A'}")
+    current_stock_list = stock_list[start_index:end_index]
+    print(f"\n待生成股票数: {len(current_stock_list)}")
+    print(f"从: {current_stock_list[0] if current_stock_list else 'N/A'}")
+    print(f"到: {current_stock_list[-1] if current_stock_list else 'N/A'}")
     print(f"输出目录: {output_dir}")
+    if args.dry_run:
+        print("运行模式: dry-run（不调用DashScope API）")
 
     # 开始批量生成
     print("\n开始批量生成报告...")
@@ -199,7 +254,7 @@ def main():
     MAX_CONTINUOUS_FAILURES = 5
     continuous_failures = 0
 
-    for i in range(start_index, len(stock_list)):
+    for i in range(start_index, end_index):
         if should_exit:
             print("\n收到退出信号，保存进度后退出...")
             save_progress(data_dir, i)
@@ -211,10 +266,11 @@ def main():
 
         # 检查是否已失败太多次
         if stock_code in failed_stocks:
-            fail_count = failed_stocks[stock_code].get('count', 1)
-            if fail_count >= 3:
-                print(f"\n[{i+1}/{len(stock_list)}] 跳过 {stock_code}（已失败{fail_count}次）")
+            failed_attempts = failed_stocks[stock_code].get('count', 1)
+            if failed_attempts >= 3 and not args.retry_failed:
+                print(f"\n[{i+1}/{len(stock_list)}] 跳过 {stock_code}（已失败{failed_attempts}次）")
                 skip_count += 1
+                save_progress(data_dir, i + 1)
                 continue
 
         try:
@@ -231,12 +287,10 @@ def main():
 
             # 如果文件已存在，跳过
             if clean_name in generated_files and os.path.exists(output_path):
-                file_mtime = os.path.getmtime(output_path)
-                file_age = time.time() - file_mtime
-                if file_age < 3600:  # 文件生成于1小时内
-                    print(f"  [OK] 文件已存在，跳过: {output_filename}")
-                    skip_count += 1
-                    continue
+                print(f"  [OK] 文件已存在，跳过: {output_filename}")
+                skip_count += 1
+                save_progress(data_dir, i + 1)
+                continue
 
             # 生成报告
             result_path = generator.generate_report(stock_code, output_path)
@@ -258,10 +312,11 @@ def main():
             if (i + 1) % 10 == 0:
                 elapsed_total = time.time() - start_time
                 avg_time = elapsed_total / (i + 1 - start_index)
-                remaining = (len(stock_list) - i - 1) * avg_time
+                remaining = (end_index - i - 1) * avg_time
                 eta = datetime.now() + timedelta(seconds=remaining)
 
-                print(f"\n--- 进度: {i+1-start_index}/{len(stock_list)-start_index} ({(i+1-start_index)/(len(stock_list)-start_index)*100:.1f}%) ---")
+                total_this_run = end_index - start_index
+                print(f"\n--- 进度: {i+1-start_index}/{total_this_run} ({(i+1-start_index)/total_this_run*100:.1f}%) ---")
                 print(f"成功: {success_count}, 失败: {fail_count}, 跳过: {skip_count}")
                 print(f"平均耗时: {avg_time:.1f}秒/只")
                 print(f"预计剩余: {remaining/3600:.1f}小时")
@@ -269,7 +324,7 @@ def main():
                 print(f"速度: {3600/avg_time:.1f}只/小时")
 
             # 动态延迟
-            if i < len(stock_list) - 1:
+            if i < end_index - 1:
                 time.sleep(2)
 
         except Exception as e:
@@ -300,9 +355,9 @@ def main():
             # 保存失败记录
             save_failed_stocks(data_dir, failed_stocks)
 
-    # 清除进度文件（任务完成）
+    # 清除进度文件（任务完整跑完后）
     progress_file = os.path.join(data_dir, 'progress.json')
-    if os.path.exists(progress_file):
+    if not should_exit and end_index >= len(stock_list) and os.path.exists(progress_file):
         try:
             os.remove(progress_file)
         except:

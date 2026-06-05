@@ -1,142 +1,122 @@
 # 快速使用指南
 
-## 一键运行（推荐）
+## 1. 安装依赖
 
-### 步骤1：打开命令行
-```bash
-cd C:\Users\ge0rg\Desktop\A股报告生成系统
-```
-
-### 步骤2：安装依赖（首次运行）
 ```bash
 pip install -r requirements.txt
 ```
 
-### 步骤3：运行批量生成
+## 2. 配置 API Key
+
+复制示例配置：
+
+```bash
+cp config/.env.example config/.env
+```
+
+编辑 `config/.env`，填入 DashScope API Key：
+
+```text
+DASHSCOPE_API_KEY=你的DashScope API Key
+```
+
+## 3. 准备股票列表
+
+编辑 `data/stocks_code.txt`，每行一个 6 位股票代码：
+
+```text
+000001
+600519
+```
+
+如果文件里没有有效代码，程序会直接退出并提示补充股票列表。
+
+## 4. 运行
+
+批量生成：
+
 ```bash
 python batch_generate.py
 ```
 
----
+先验证流程：
+
+```bash
+python batch_generate.py --dry-run --limit 1
+```
+
+生成单只股票：
+
+```bash
+python src/main.py 000001
+```
+
+单只股票 dry-run：
+
+```bash
+python src/main.py 000001 --dry-run
+```
 
 ## 输出位置
 
-生成的报告保存在：
-```
-C:\Users\ge0rg\Desktop\A股报告生成系统\output\
-```
+批量生成的报告保存在：
 
-文件命名格式：
-```
-公司名称.docx
+```text
+output/
 ```
 
-例如：
-- 平安银行.docx
-- 万科A.docx
-- 茅台.docx
+文件名使用公司简称，例如：
 
----
-
-## 报告内容
-
-每份报告包含：
-1. **投资建议** - 评级和核心逻辑
-2. **投资逻辑** - 深度分析（200-300字）
-3. **公司概况** - 基本信息
-4. **财务分析** - 数据和分析
-5. **业务展望** - 前景分析
-6. **可比对比** - 同业对比
-
----
-
-## 预计时间
-
-- 总股票数：5,472只
-- 每只耗时：约50秒
-- **总计：约75小时**（3天+）
-
-建议：
-- 周末开始运行
-- 保持电脑不休眠
-- 稳定网络连接
-
----
-
-## 查看进度
-
-程序会实时显示：
-```
-[1/5472] 正在生成 000001 的报告...
-✓ 成功: 平安银行.docx
-
-[2/5472] 正在生成 000002 的报告...
-✓ 成功: 万科A.docx
-
---- 进度: 10/5472 ---
-成功: 10, 失败: 0
+```text
+平安银行.docx
+贵州茅台.docx
 ```
 
----
+## 断点续跑
 
-## 常见问题
+程序运行时会自动写入：
 
-**Q: 程序中断了怎么办？**
-A: 重新运行即可，会继续生成（已跳过已生成的股票）
+- `data/progress.json`
+- `data/failed_stocks.json`
 
-**Q: 如何只生成部分股票？**
-A: 编辑 data/remaining_stocks.txt 文件，修改股票代码列表
+中断后重新运行，会继续处理后续股票。已生成的同名报告会自动跳过。
 
-**Q: API限流怎么办？**
-A: 程序会自动等待，无需手动干预
+## 本地知识库
 
-**Q: 文件名重复怎么办？**
-A: 程序会自动覆盖同名文件
+将 `.md` 或 `.txt` 资料放入：
 
----
-
-## 配置文件
-
-API密钥位置：
-```
-config/.env
+```text
+knowledge_base/raw/
 ```
 
-内容：
+系统会在生成报告时检索相关资料，并把资料片段注入报告生成提示词。
+
+常用参数：
+
+```bash
+python batch_generate.py --rag-top-k 6
+python batch_generate.py --no-rag
 ```
-DASHSCOPE_API_KEY=你的密钥
+
+## 常用批处理参数
+
+```bash
+python batch_generate.py --limit 10
+python batch_generate.py --start-from 600519
+python batch_generate.py --retry-failed
+python batch_generate.py --output-dir output/test
 ```
 
-获取API密钥：https://dashscope.aliyun.com/
+## 日志
 
----
+日志保存在：
 
-## 日志文件
-
-运行日志保存在：
-```
+```text
 logs/
 ```
 
 查看最新日志：
+
 ```bash
 tail -f logs/*.log
 ```
-
----
-
-## 完成！
-
-生成完成后会显示：
-```
-============================================================
-批量生成完成！
-============================================================
-总数: 5472
-成功: 5450
-失败: 22
-成功率: 99.60%
-报告保存位置: C:\Users\ge0rg\Desktop\A股报告生成系统\output
-```
-
-所有报告就在 `output` 文件夹中，可以直接使用！

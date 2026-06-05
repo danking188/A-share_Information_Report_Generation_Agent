@@ -30,11 +30,11 @@ REM 显示配置信息
 echo 配置信息：
 echo   输出目录: output\
 echo   配置文件: config\.env
-echo   数据文件: data\remaining_stocks.txt
+echo   数据文件: data\stocks_code.txt
 echo.
 
 REM 询问是否继续
-echo 准备开始批量生成，预计需要75小时...
+echo 准备开始批量生成，实际耗时取决于股票数量和API响应速度。
 set /p confirm="确认开始？(Y/N): "
 
 if /i not "%confirm%"=="Y" (
@@ -49,8 +49,8 @@ echo   开始批量生成...
 echo ========================================
 echo.
 
-REM 运行批量生成脚本（优化版）
-python batch_generate_optimized.py
+REM 运行批量生成脚本
+python batch_generate.py
 
 echo.
 echo ========================================

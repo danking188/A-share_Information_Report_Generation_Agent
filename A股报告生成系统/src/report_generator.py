@@ -245,10 +245,7 @@ if __name__ == "__main__":
         'stock_name': '凯文教育',
         'symbol': '002659',
         'sections': {
-            'investment_advice': {
-                'rating': '推荐',
-                'logic': '公司业绩良好，行业地位稳固，具有增长潜力。'
-            },
+            'investment_advice': '投资建议：推荐。公司业绩良好，行业地位稳固，具有增长潜力。',
             'company_overview': '这是一家教育服务公司。',
             'financial_indicators': '### 主要财务指标\n营业收入：...',
             'financial_analysis': '财务状况良好...',

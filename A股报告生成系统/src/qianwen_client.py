@@ -1,21 +1,41 @@
 """
 千问API集成模块
 使用千问大模型生成研究报告内容
-启用联网搜索功能获取公司概况
 """
 
-import dashscope
-from dashscope import Generation
+try:
+    import dashscope
+    from dashscope import Generation
+except ImportError:
+    dashscope = None
+    Generation = None
 from typing import Dict, List, Optional, Callable
-from loguru import logger
 import json
 import time
+
+try:
+    from loguru import logger
+except ImportError:
+    class _FallbackLogger:
+        def info(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+        def error(self, *args, **kwargs):
+            pass
+
+        def debug(self, *args, **kwargs):
+            pass
+
+    logger = _FallbackLogger()
 
 
 class QianwenClient:
     """千问API客户端"""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, dry_run: bool = False):
         """
         初始化千问客户端
 
@@ -23,10 +43,33 @@ class QianwenClient:
             api_key: 千问API密钥
         """
         self.api_key = api_key
-        dashscope.api_key = api_key
+        if dashscope is not None:
+            dashscope.api_key = api_key
         self.model = "qwen-max"  # 使用千问最大模型
         self.total_tokens = 0  # 总token使用量
         self.call_count = 0  # API调用次数
+        self.dry_run = dry_run
+        self.forbidden_phrases = [
+            "综上所述",
+            "值得注意的是",
+            "总而言之",
+            "总体来看",
+            "需要指出的是",
+        ]
+
+    def _rag_block(self, stock_data: Dict) -> str:
+        """Format retrieved local knowledge for prompts."""
+        context = stock_data.get('rag_context') or ''
+        if not context:
+            return "暂无本地知识库资料"
+        return context
+
+    def _clean_output(self, text: str) -> str:
+        """Remove common template phrases from generated text."""
+        cleaned = text.strip()
+        for phrase in self.forbidden_phrases:
+            cleaned = cleaned.replace(phrase, "")
+        return cleaned.strip()
 
     def _call_api(self, messages: List[Dict], temperature: float = 0.7,
                   max_tokens: int = 7000, enable_search: bool = False) -> str:
@@ -44,6 +87,13 @@ class QianwenClient:
         """
         max_retries = 5
         retry_delay = 3
+
+        if self.dry_run:
+            self.call_count += 1
+            return "dry-run模式：此处为模拟生成内容，未调用DashScope API。"
+
+        if Generation is None:
+            raise ImportError("未安装dashscope，请先运行 pip install -r requirements.txt")
 
         for attempt in range(max_retries):
             try:
@@ -84,7 +134,7 @@ class QianwenClient:
                         self.call_count += 1
                         logger.info("API调用成功 (无token信息)")
 
-                    return result
+                    return self._clean_output(result)
                 else:
                     logger.error(f"API调用失败: {response.code} - {response.message}")
                     if attempt < max_retries - 1:
@@ -205,20 +255,20 @@ class QianwenClient:
         main_business = stock_data.get('main_business', 'N/A')
 
         # 当前股价和估值数据
-        current_data = stock_data.get('current_data', {})
-        current_price = current_data.get('current_price', 'N/A')
-        pe_ratio = current_data.get('pe_ratio', 'N/A')
-        pb_ratio = current_data.get('pb_ratio', 'N/A')
-        market_cap = current_data.get('market_cap', 'N/A')
+        current_price = stock_data.get('current_price', 'N/A')
+        pe_ratio = stock_data.get('pe_ratio', 'N/A')
+        pb_ratio = stock_data.get('pb_ratio', 'N/A')
+        market_cap = stock_data.get('market_cap', 'N/A')
 
         # 最新财务数据
-        latest = stock_data.get('latest_financial', {})
-        revenue = latest.get('operating_revenue', 'N/A')
+        latest = stock_data.get('financial_summary', {})
+        revenue = latest.get('revenue', 'N/A')
         net_profit = latest.get('net_profit', 'N/A')
-        roe = latest.get('roe', 'N/A')
+        roe = stock_data.get('key_metrics', {}).get('roe', 'N/A')
 
         # 历史财务趋势
         historical = stock_data.get('historical_financial', {})
+        rag_context = self._rag_block(stock_data)
         historical_desc = ""
         if len(historical) >= 2:
             periods = list(historical.items())[:2]
@@ -256,6 +306,9 @@ class QianwenClient:
 **历史财务趋势：**
 {historical_desc if historical_desc else '暂无历史数据'}
 
+**本地知识库检索资料：**
+{rag_context}
+
 **输出要求：**
 - 200-300字
 - 深入分析投资该公司的核心逻辑
@@ -264,6 +317,7 @@ class QianwenClient:
 - 严禁使用"综上所述"、"值得注意的是"、"总而言之"等AI痕迹词汇
 - 积极但客观，突出投资亮点
 - 严格基于上述真实数据，不编造财务指标
+- 如果使用知识库资料，只能使用资料中明确出现的信息
 """
 
         messages = [
@@ -273,7 +327,10 @@ class QianwenClient:
 
         return self._call_api(messages, temperature=0.7, max_tokens=1500)
 
-    def generate_company_overview(self, stock_name: str, symbol: str) -> str:
+    def generate_company_overview(self, stock_name: str, symbol: str,
+                                  main_business: str = 'N/A',
+                                  industry: str = 'N/A',
+                                  rag_context: str = '') -> str:
         """
         生成公司概况（基于已有数据和知识）
 
@@ -287,16 +344,55 @@ class QianwenClient:
         prompt = f"""
 请为{stock_name}({symbol})生成公司概况。
 
+**已知信息：**
+- 行业：{industry}
+- 主营业务：{main_business}
+
+**本地知识库检索资料：**
+{rag_context or '暂无本地知识库资料'}
+
 **要求：**
 - 100-150字
 - 简洁介绍公司主营业务和行业地位
-- 只陈述核心事实
+- 优先使用上述已知信息
 - 严禁使用"综上所述"、"值得注意的是"等AI痕迹词汇
-- 严格基于已有知识，不确定就说"相关信息暂未披露"
+- 不确定就说"相关信息暂未披露"
 """
 
         messages = [
             {"role": "system", "content": "专业研究员，提供准确简洁的公司信息。"},
+            {"role": "user", "content": prompt}
+        ]
+
+        return self._call_api(messages, temperature=0.5, max_tokens=1500)
+
+    def generate_company_overview_from_data(self, stock_data: Dict) -> str:
+        """Generate company overview using stock data and RAG context."""
+        stock_name = stock_data.get('stock_name', 'N/A')
+        symbol = stock_data.get('symbol', 'N/A')
+        main_business = stock_data.get('main_business', 'N/A')
+        industry = stock_data.get('industry', 'N/A')
+        prompt = f"""
+请为{stock_name}({symbol})生成公司概况。
+
+**已知信息：**
+- 行业：{industry}
+- 主营业务：{main_business}
+
+**本地知识库检索资料：**
+{self._rag_block(stock_data)}
+
+**要求：**
+- 100-150字
+- 简洁介绍公司主营业务和行业地位
+- 优先使用上述已知信息和检索资料
+- 严禁使用"综上所述"、"值得注意的是"等AI痕迹词汇
+- 不确定就说"相关信息暂未披露"
+- 不编造市场份额、排名或具体数值
+"""
+
+        messages = [
+            {"role": "system", "content": "专业研究员，基于给定资料提供准确简洁的公司信息。"},
             {"role": "user", "content": prompt}
         ]
 
@@ -489,7 +585,8 @@ class QianwenClient:
         return self._call_api(messages, temperature=0.6, max_tokens=2000)
 
     def generate_business_outlook(self, stock_name: str, symbol: str,
-                                  main_business: str) -> str:
+                                  main_business: str, industry: str = 'N/A',
+                                  rag_context: str = '') -> str:
         """
         生成业务展望和行业地位
 
@@ -504,6 +601,13 @@ class QianwenClient:
         prompt = f"""
 请为{stock_name}({symbol})生成业务展望和行业地位分析。
 
+**已知信息：**
+- 行业：{industry}
+- 主营业务：{main_business}
+
+**本地知识库检索资料：**
+{rag_context or '暂无本地知识库资料'}
+
 **分析重点：**
 - 行业发展趋势和市场空间
 - 公司行业地位和核心竞争优势
@@ -515,6 +619,7 @@ class QianwenClient:
 - 聚焦核心亮点
 - 积极但客观
 - 严禁"综上所述"、"值得注意的是"等AI痕迹词汇
+- 不编造具体财务数据、市场份额或排名
 - 不确定就说"相关信息暂未披露"
 """
 
@@ -526,7 +631,7 @@ class QianwenClient:
         return self._call_api(messages, temperature=0.7, max_tokens=2000)
 
     def generate_comparable_analysis(self, stock_name: str, symbol: str,
-                                     industry: str) -> str:
+                                     industry: str, rag_context: str = '') -> str:
         """
         生成可比上市公司对比
 
@@ -540,6 +645,12 @@ class QianwenClient:
         """
         prompt = f"""
 请为{stock_name}({symbol})生成可比上市公司对比分析。
+
+**已知信息：**
+- 行业：{industry}
+
+**本地知识库检索资料：**
+{rag_context or '暂无本地知识库资料'}
 
 **分析要求：**
 - 简要分析同行业典型公司
@@ -574,6 +685,9 @@ class QianwenClient:
         """
         logger.info(f"开始生成股票 {stock_data.get('symbol')} 的完整研究报告...")
 
+        if self.dry_run:
+            return self._generate_dry_run_report(stock_data)
+
         stock_name = stock_data.get('stock_name', 'N/A')
         symbol = stock_data.get('symbol', 'N/A')
         main_business = stock_data.get('main_business', 'N/A')
@@ -596,9 +710,7 @@ class QianwenClient:
 
         # 3. 公司概况
         logger.info("生成公司概况...")
-        report['sections']['company_overview'] = self.generate_company_overview(
-            stock_name, symbol
-        )
+        report['sections']['company_overview'] = self.generate_company_overview_from_data(stock_data)
 
         # 4. 主要财务指标
         logger.info("生成主要财务指标...")
@@ -615,13 +727,13 @@ class QianwenClient:
         # 6. 业务展望和行业地位
         logger.info("生成业务展望和行业地位...")
         report['sections']['business_outlook'] = self.generate_business_outlook(
-            stock_name, symbol, main_business
+            stock_name, symbol, main_business, industry, stock_data.get('rag_context', '')
         )
 
         # 7. 可比上市公司对比
         logger.info("生成可比上市公司对比...")
         report['sections']['comparable_analysis'] = self.generate_comparable_analysis(
-            stock_name, symbol, industry
+            stock_name, symbol, industry, stock_data.get('rag_context', '')
         )
 
         logger.info("研究报告生成完成！")
@@ -636,6 +748,35 @@ class QianwenClient:
         logger.info("=" * 60)
 
         return report
+
+    def _generate_dry_run_report(self, stock_data: Dict) -> Dict:
+        """Create a deterministic report for local testing without API calls."""
+        stock_name = stock_data.get('stock_name', 'N/A')
+        symbol = stock_data.get('symbol', 'N/A')
+        industry = stock_data.get('industry', '未分类')
+        main_business = stock_data.get('main_business', '相关信息暂未披露')
+        financial_summary = stock_data.get('financial_summary', {})
+        revenue = financial_summary.get('revenue', 'N/A')
+        net_profit = financial_summary.get('net_profit', 'N/A')
+        rag_note = "已检索到本地知识库资料" if stock_data.get('rag_context') else "暂无本地知识库资料"
+
+        return {
+            'symbol': symbol,
+            'stock_name': stock_name,
+            'generate_time': stock_data.get('fetch_time'),
+            'sections': {
+                'investment_advice': (
+                    f"投资建议：持有。{stock_name}所属行业为{industry}，主营业务为{main_business}。"
+                    f"当前dry-run模式未调用模型，最新营收为{revenue}，净利润为{net_profit}。"
+                ),
+                'investment_logic': f"{stock_name}的投资逻辑需结合财务趋势、行业空间和公司竞争力判断。{rag_note}。",
+                'company_overview': f"{stock_name}({symbol})主营业务为{main_business}，所属行业为{industry}。",
+                'financial_indicators': self.generate_financial_indicators(stock_data),
+                'financial_analysis': f"{stock_name}最新营收为{revenue}，净利润为{net_profit}。dry-run模式仅用于验证流程。",
+                'business_outlook': f"{stock_name}后续展望应结合行业景气度、业务执行情况和公开资料持续跟踪。{rag_note}。",
+                'comparable_analysis': f"{industry}内可比公司需结合业务结构、盈利能力和估值水平进一步筛选。"
+            }
+        }
 
 
 if __name__ == "__main__":

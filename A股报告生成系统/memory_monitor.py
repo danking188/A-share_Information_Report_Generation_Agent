@@ -80,7 +80,7 @@ def main():
             # 状态提示
             rss_mb = proc_mem['rss']
             if rss_mb < 500:
-                status = "✓ 正常"
+                status = "正常"
                 color = "绿色"
             elif rss_mb < 1000:
                 status = "⚠ 轻微压力"
@@ -98,9 +98,8 @@ def main():
             # 建议
             if rss_mb > 1500:
                 print("【建议】")
-                print("  1. 使用改进版 batch_generate_improved.py")
-                print("  2. 考虑重启程序")
-                print("  3. 分批处理股票（每次500-1000只）")
+                print("  1. 考虑重启程序")
+                print("  2. 分批处理股票（每次500-1000只）")
                 print()
 
             time.sleep(2)

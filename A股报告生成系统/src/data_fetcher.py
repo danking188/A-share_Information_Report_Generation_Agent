@@ -96,6 +96,26 @@ class StockDataFetcher:
             logger.error(f"获取股票列表失败: {e}")
             raise
 
+    def get_stock_spot_data(self) -> pd.DataFrame:
+        """获取并缓存沪深A股实时行情列表"""
+        cache_key = "stock_spot_em"
+        cached = self._get_cached_data(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            logger.info("获取沪深A股实时行情列表...")
+            spot_data = ak.stock_zh_a_spot_em()
+            if spot_data is not None and not spot_data.empty and '代码' in spot_data.columns:
+                spot_data = spot_data.copy()
+                spot_data['代码'] = spot_data['代码'].astype(str).str.zfill(6)
+            self._set_cache(cache_key, spot_data)
+            logger.info(f"成功获取 {len(spot_data)} 条实时行情")
+            return spot_data
+        except Exception as e:
+            logger.error(f"获取实时行情列表失败: {e}")
+            return pd.DataFrame()
+
     def get_stock_basic_info(self, symbol: str) -> Dict:
         """
         获取股票基本信息 - 优化版（移除不稳定API）
@@ -111,9 +131,27 @@ class StockDataFetcher:
         if cached is not None:
             return cached
 
-        # 返回空字典，这些API调用不稳定，不作为核心功能
-        # 主要信息已通过 get_stock_list() 获取股票名称
-        return {}
+        try:
+            logger.info(f"获取股票 {symbol} 基本信息...")
+            info = ak.stock_individual_info_em(symbol=symbol)
+            if info is None or info.empty:
+                return {}
+
+            items = info['item'].astype(str).tolist() if 'item' in info.columns else []
+            values = info['value'].tolist() if 'value' in info.columns else []
+            item_map = dict(zip(items, values))
+            result = {
+                'individual_info': {
+                    'item': items,
+                    'value': values,
+                    'items': item_map
+                }
+            }
+            self._set_cache(cache_key, result)
+            return result
+        except Exception as e:
+            logger.warning(f"获取股票基本信息失败: {e}")
+            return {}
 
     def get_stock_realtime_quote(self, symbol: str) -> Dict:
         """
@@ -132,11 +170,17 @@ class StockDataFetcher:
 
         try:
             logger.info(f"获取股票 {symbol} 实时行情...")
-            # 移除了获取全部股票列表再筛选的方式，性能太差
-            # 直接返回空字典，避免影响主流程
-            # 实时行情对报告生成不是必需的
-            logger.warning(f"实时行情功能已禁用（性能优化）")
-            return {}
+            spot_data = self.get_stock_spot_data()
+            if spot_data is None or spot_data.empty or '代码' not in spot_data.columns:
+                return {}
+
+            match = spot_data[spot_data['代码'] == str(symbol).zfill(6)]
+            if match.empty:
+                return {}
+
+            quote = match.iloc[0].to_dict()
+            self._set_cache(cache_key, quote)
+            return quote
 
         except Exception as e:
             logger.error(f"获取实时行情失败: {e}")
@@ -184,7 +228,7 @@ class StockDataFetcher:
                 profit_sheet = ak.stock_financial_report_sina(stock=symbol, symbol="利润表")
                 if profit_sheet is not None and not profit_sheet.empty:
                     financial_data['profit_sheet_sina'] = profit_sheet
-                    logger.info(f"✓ 获取利润表成功: {len(profit_sheet)} 行数据")
+                    logger.info(f"获取利润表成功: {len(profit_sheet)} 行数据")
                 else:
                     logger.warning("利润表数据为空")
 
@@ -192,7 +236,7 @@ class StockDataFetcher:
                 balance_sheet = ak.stock_financial_report_sina(stock=symbol, symbol="资产负债表")
                 if balance_sheet is not None and not balance_sheet.empty:
                     financial_data['balance_sheet_sina'] = balance_sheet
-                    logger.info(f"✓ 获取资产负债表成功: {len(balance_sheet)} 行数据")
+                    logger.info(f"获取资产负债表成功: {len(balance_sheet)} 行数据")
                 else:
                     logger.warning("资产负债表数据为空")
 
@@ -200,7 +244,7 @@ class StockDataFetcher:
                 cash_flow = ak.stock_financial_report_sina(stock=symbol, symbol="现金流量表")
                 if cash_flow is not None and not cash_flow.empty:
                     financial_data['cash_flow_sina'] = cash_flow
-                    logger.info(f"✓ 获取现金流量表成功: {len(cash_flow)} 行数据")
+                    logger.info(f"获取现金流量表成功: {len(cash_flow)} 行数据")
                 else:
                     logger.warning("现金流量表数据为空")
 
@@ -229,8 +273,14 @@ class StockDataFetcher:
         Returns:
             行业信息
         """
-        # 移除不稳定的API调用，返回默认行业分类
-        return {'industry': '未分类', 'board': None}
+        try:
+            basic_info = self.get_stock_basic_info(symbol)
+            items = basic_info.get('individual_info', {}).get('items', {})
+            industry = items.get('行业') or items.get('所属行业') or '未分类'
+            return {'industry': industry, 'board': None}
+        except Exception as e:
+            logger.warning(f"获取行业信息失败: {e}")
+            return {'industry': '未分类', 'board': None}
 
     def get_stock_news(self, symbol: str, days: int = 30) -> pd.DataFrame:
         """
@@ -265,11 +315,11 @@ class StockDataFetcher:
             'fetch_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        # 1. 基本信息（已简化，不调用API）
-        comprehensive_data['basic_info'] = {}
+        # 1. 基本信息
+        comprehensive_data['basic_info'] = self.get_stock_basic_info(symbol)
 
-        # 2. 实时行情（已禁用）
-        comprehensive_data['realtime_quote'] = {}
+        # 2. 实时行情
+        comprehensive_data['realtime_quote'] = self.get_stock_realtime_quote(symbol)
 
         # 3. 历史数据（已禁用）
         comprehensive_data['historical_data'] = pd.DataFrame()
@@ -281,8 +331,8 @@ class StockDataFetcher:
             logger.error(f"获取财务数据失败: {e}")
             comprehensive_data['financial_data'] = {}
 
-        # 5. 行业信息（使用默认值）
-        comprehensive_data['industry_info'] = {'industry': '未分类', 'board': None}
+        # 5. 行业信息
+        comprehensive_data['industry_info'] = self.get_stock_industry(symbol)
 
         # 6. 新闻（已禁用）
         comprehensive_data['news'] = pd.DataFrame()

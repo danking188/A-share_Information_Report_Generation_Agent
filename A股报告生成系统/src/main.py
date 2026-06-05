@@ -18,12 +18,15 @@ import gc
 from data_fetcher import StockDataFetcher
 from qianwen_client import QianwenClient
 from report_generator import ReportGenerator
+from rag import RAGRetriever
 
 
 class ResearchReportGenerator:
     """研究报告生成器主类（内存优化版）"""
 
-    def __init__(self, api_key: str, auto_clean_interval: int = 10):
+    def __init__(self, api_key: str, auto_clean_interval: int = 10,
+                 knowledge_base_dir: Optional[str] = None, rag_enabled: bool = True,
+                 rag_top_k: int = 6, dry_run: bool = False):
         """
         初始化生成器
 
@@ -33,18 +36,30 @@ class ResearchReportGenerator:
         """
         self.api_key = api_key
         self.fetcher = StockDataFetcher()
-        self.qianwen_client = QianwenClient(api_key)
+        self.qianwen_client = QianwenClient(api_key, dry_run=dry_run)
         self.report_generator = None  # 延迟初始化，每次生成时创建新实例
 
         self.auto_clean_interval = auto_clean_interval
         self._report_count = 0  # 报告计数器
+        self.dry_run = dry_run
+        self.rag_enabled = rag_enabled
+        self.rag_top_k = rag_top_k
+        self.project_dir = os.path.dirname(os.path.dirname(__file__))
+        self.knowledge_base_dir = knowledge_base_dir or os.path.join(self.project_dir, 'knowledge_base')
+        self.rag_retriever = None
 
         # 设置日志
         self._setup_logger()
 
+        if self.rag_enabled:
+            self.rag_retriever = RAGRetriever(self.knowledge_base_dir, top_k=self.rag_top_k)
+            chunk_count = self.rag_retriever.ensure_index()
+            logger.info(f"RAG知识库已加载: {chunk_count} 个片段")
+
     def _setup_logger(self):
         """配置日志系统"""
-        log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        log_dir = os.path.join(project_dir, 'logs')
         os.makedirs(log_dir, exist_ok=True)
 
         log_file = os.path.join(
@@ -125,18 +140,27 @@ class ResearchReportGenerator:
         """
         logger.info("处理股票数据...")
 
+        symbol = raw_data.get('symbol')
+        stock_name = self.fetcher.get_stock_name(symbol or '')
         processed_data = {
-            'symbol': raw_data.get('symbol'),
-            'stock_name': self.fetcher.get_stock_name(raw_data.get('symbol', '')),
+            'symbol': symbol,
+            'stock_name': stock_name,
             'fetch_time': raw_data.get('fetch_time'),
         }
 
         # 提取基本信息
         basic_info = raw_data.get('basic_info', {})
-        processed_data['company_full_name'] = self._extract_from_dict(basic_info, 'company_info', 'company_name')
-        processed_data['main_business'] = self._extract_from_dict(basic_info, 'company_info', 'main_business')
-        processed_data['industry'] = '未分类'
-        processed_data['profile'] = self._extract_from_dict(basic_info, 'company_info', 'company_profile')
+        individual_items = self._extract_individual_items(basic_info)
+        processed_data['company_full_name'] = str(
+            individual_items.get('股票简称') or individual_items.get('名称') or stock_name
+        )
+        processed_data['main_business'] = str(
+            individual_items.get('主营业务') or individual_items.get('经营范围') or '相关信息暂未披露'
+        )
+        processed_data['industry'] = str(
+            individual_items.get('行业') or individual_items.get('所属行业') or '未分类'
+        )
+        processed_data['profile'] = processed_data['main_business']
 
         # 提取实时行情
         quote = raw_data.get('realtime_quote', {})
@@ -181,8 +205,7 @@ class ResearchReportGenerator:
         }
 
         # 行业背景
-        industry_info = raw_data.get('industry_info', {})
-        processed_data['industry_background'] = '行业分析待完善'
+        processed_data['industry_background'] = processed_data['industry']
 
         # 提取新闻（最近10条）
         news = raw_data.get('news')
@@ -195,12 +218,50 @@ class ResearchReportGenerator:
 
         # 提取行业信息（用于后续联网搜索使用）
         industry_info = raw_data.get('industry_info', {})
-        if industry_info and 'industry' in industry_info:
-            processed_data['industry'] = str(industry_info['industry'].iloc[0]['板块名称']) if hasattr(industry_info['industry'], 'iloc') else '未分类'
-        else:
-            processed_data['industry'] = '未分类'
+        industry_value = industry_info.get('industry') if isinstance(industry_info, dict) else None
+        if isinstance(industry_value, pd.DataFrame) and not industry_value.empty:
+            if '板块名称' in industry_value.columns:
+                processed_data['industry'] = str(industry_value.iloc[0]['板块名称'])
+        elif industry_value and str(industry_value) != '未分类':
+            processed_data['industry'] = str(industry_value)
 
         logger.info("数据处理完成")
+        return processed_data
+
+    def _extract_individual_items(self, basic_info: Dict) -> Dict:
+        """提取个股基本信息中的 item/value 映射"""
+        individual_info = basic_info.get('individual_info', {}) if basic_info else {}
+        if isinstance(individual_info.get('items'), dict):
+            return individual_info['items']
+
+        items = individual_info.get('item', [])
+        values = individual_info.get('value', [])
+        return dict(zip([str(item) for item in items], values))
+
+    def _attach_rag_context(self, processed_data: Dict) -> Dict:
+        """检索本地知识库并附加到报告数据中"""
+        processed_data['rag_context'] = ''
+        if not self.rag_enabled or not self.rag_retriever:
+            return processed_data
+
+        query_parts = [
+            processed_data.get('stock_name', ''),
+            processed_data.get('symbol', ''),
+            processed_data.get('industry', ''),
+            processed_data.get('main_business', ''),
+            '公司概况 行业地位 竞争优势 可比公司 投资逻辑'
+        ]
+        query = ' '.join(str(part) for part in query_parts if part)
+        try:
+            context = self.rag_retriever.build_context(query, top_k=self.rag_top_k)
+            processed_data['rag_context'] = context
+            if context:
+                logger.info(f"RAG检索完成，注入资料长度: {len(context)} 字符")
+            else:
+                logger.info("RAG知识库未命中相关资料")
+        except Exception as e:
+            logger.warning(f"RAG检索失败，继续使用基础数据生成: {e}")
+
         return processed_data
 
     def _extract_from_dict(self, data: Dict, *keys) -> str:
@@ -374,6 +435,7 @@ class ResearchReportGenerator:
             # 2. 处理数据
             logger.info("步骤 2/4: 处理数据...")
             processed_data = self._process_stock_data(stock_data)
+            processed_data = self._attach_rag_context(processed_data)
 
             # 2.5. 验证关键数据是否存在
             logger.info("步骤 2.5/4: 验证数据完整性...")
@@ -464,15 +526,8 @@ class ResearchReportGenerator:
 
 def main():
     """主函数"""
-    # 加载环境变量
-    load_dotenv()
-
-    # 获取API密钥
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        logger.error("错误: 未找到DASHSCOPE_API_KEY环境变量")
-        logger.error("请在.env文件中设置DASHSCOPE_API_KEY=your_api_key")
-        sys.exit(1)
+    project_dir = os.path.dirname(os.path.dirname(__file__))
+    load_dotenv(os.path.join(project_dir, 'config', '.env'))
 
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='A股研究报告自动生成系统（内存优化版）')
@@ -481,11 +536,33 @@ def main():
     parser.add_argument('-b', '--batch', help='批量生成模式，指定包含股票代码的文件')
     parser.add_argument('--clean-interval', type=int, default=10,
                        help='自动清理间隔（默认每10份报告清理一次）')
+    parser.add_argument('--output-dir', default=None, help='批量模式下的输出目录')
+    parser.add_argument('--limit', type=int, default=None, help='批量模式下最多处理多少只股票')
+    parser.add_argument('--dry-run', action='store_true', help='不调用DashScope API，用模拟内容验证流程')
+    parser.add_argument('--no-rag', action='store_true', help='禁用本地知识库检索')
+    parser.add_argument('--knowledge-base', default=None, help='知识库目录，默认 knowledge_base/')
+    parser.add_argument('--rag-top-k', type=int, default=6, help='RAG最多注入的资料片段数')
 
     args = parser.parse_args()
 
+    # 获取API密钥
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key and not args.dry_run:
+        logger.error("错误: 未找到DASHSCOPE_API_KEY环境变量")
+        logger.error("请在config/.env文件中设置DASHSCOPE_API_KEY=your_api_key")
+        sys.exit(1)
+    if args.dry_run and not api_key:
+        api_key = "dry-run"
+
     # 创建生成器（带内存优化）
-    generator = ResearchReportGenerator(api_key, auto_clean_interval=args.clean_interval)
+    generator = ResearchReportGenerator(
+        api_key,
+        auto_clean_interval=args.clean_interval,
+        knowledge_base_dir=args.knowledge_base,
+        rag_enabled=not args.no_rag,
+        rag_top_k=args.rag_top_k,
+        dry_run=args.dry_run,
+    )
 
     try:
         if args.batch:
@@ -497,9 +574,18 @@ def main():
                 sys.exit(1)
 
             with open(args.batch, 'r', encoding='utf-8') as f:
-                stock_codes = [line.strip() for line in f if line.strip()]
+                stock_codes = [line.strip() for line in f if line.strip() and not line.lstrip().startswith('#')]
+
+            if args.limit is not None:
+                if args.limit <= 0:
+                    logger.error("--limit 必须大于0")
+                    sys.exit(1)
+                stock_codes = stock_codes[:args.limit]
 
             logger.info(f"共 {len(stock_codes)} 只股票待生成报告")
+            if not stock_codes:
+                logger.error("股票代码列表为空")
+                sys.exit(1)
 
             success_count = 0
             fail_count = 0
@@ -507,7 +593,11 @@ def main():
             for i, code in enumerate(stock_codes, 1):
                 try:
                     logger.info(f"\n处理第 {i}/{len(stock_codes)} 只股票: {code}")
-                    output = generator.generate_report(code)
+                    output_path = None
+                    if args.output_dir:
+                        os.makedirs(args.output_dir, exist_ok=True)
+                        output_path = os.path.join(args.output_dir, f"{code}.docx")
+                    generator.generate_report(code, output_path)
                     success_count += 1
                 except Exception as e:
                     logger.error(f"生成 {code} 报告失败: {e}")
@@ -521,7 +611,8 @@ def main():
             logger.info("=" * 60)
             logger.info(f"批量生成完成！")
             logger.info(f"总数: {len(stock_codes)}, 成功: {success_count}, 失败: {fail_count}")
-            logger.info(f"成功率: {success_count/len(stock_codes)*100:.2f}%")
+            if stock_codes:
+                logger.info(f"成功率: {success_count/len(stock_codes)*100:.2f}%")
             logger.info("=" * 60)
 
         elif args.stock_code:

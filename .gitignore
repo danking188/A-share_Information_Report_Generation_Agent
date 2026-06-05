@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime output
+logs/
+output/
+*.log
+knowledge_base/index/
+A股报告生成系统/knowledge_base/index/
+
+# Local configuration and secrets
+.env
+config/.env
+*.local
+
+# IDE and local assistant settings
+.idea/
+.vscode/
+.claude/
+
+# OS files
+.DS_Store
+_nul
