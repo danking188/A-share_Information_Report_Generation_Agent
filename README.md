@@ -34,6 +34,4 @@ A股报告生成系统/knowledge_base/raw/
 - `A股报告生成系统/PROJECT_INFO.md`：项目说明
 - `A股报告生成系统/QUICKSTART.md`：快速使用指南
 
-## 注意
 
-`config/.env`、`output/`、`logs/`、`knowledge_base/index/` 和本地 IDE 配置不会提交到仓库。API Key 只应保存在本地环境中。
