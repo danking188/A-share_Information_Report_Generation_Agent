@@ -13,6 +13,12 @@ output/
 *.log
 knowledge_base/index/
 A股报告生成系统/knowledge_base/index/
+A股报告生成系统/data/progress.json
+A股报告生成系统/data/failed_stocks.json
+A股报告生成系统/data/workflow_states/
+A股报告生成系统/data/workflow_cache/
+A股报告生成系统/.test-output/
+A股报告生成系统/.test-state/
 
 # Local configuration and secrets
 .env

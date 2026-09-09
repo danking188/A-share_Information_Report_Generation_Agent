@@ -1,19 +1,19 @@
 # A股研究报告生成系统 - 依赖包
 
 # 核心依赖
-akshare>=1.12.0
-dashscope>=1.10.0
-python-docx>=1.1.0
-python-dotenv>=1.0.0
+akshare==1.18.94
+dashscope==1.27.4
+python-docx==1.2.0
+python-dotenv==1.2.3
 
 # 数据处理
-pandas>=2.0.0
-numpy>=1.24.0
+pandas==3.0.5
+numpy==2.5.3
 
 # 日志和进度条
-loguru>=0.7.0
-tqdm>=4.65.0
-psutil>=5.9.0
+loguru==0.7.3
+tqdm==4.70.0
+psutil==7.2.2
 
 # 网络请求
-requests>=2.31.0
+requests==2.34.2

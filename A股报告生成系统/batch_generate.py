@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.main import ResearchReportGenerator
-from src.data_fetcher import StockDataFetcher
+from src.settings import AppSettings
+from src.workflow_state import atomic_write_json
 from dotenv import load_dotenv
 
 # 全局变量用于退出
@@ -41,8 +42,7 @@ def save_failed_stocks(data_dir, failed_stocks):
     """保存失败股票列表"""
     failed_file = os.path.join(data_dir, 'failed_stocks.json')
     try:
-        with open(failed_file, 'w', encoding='utf-8') as f:
-            json.dump(failed_stocks, f, ensure_ascii=False, indent=2)
+        atomic_write_json(failed_file, failed_stocks)
     except Exception as e:
         print(f"警告：保存失败股票列表时出错: {e}")
 
@@ -63,8 +63,7 @@ def save_progress(data_dir, current_index):
     """保存进度"""
     progress_file = os.path.join(data_dir, 'progress.json')
     try:
-        with open(progress_file, 'w', encoding='utf-8') as f:
-            json.dump({'current_index': current_index}, f, ensure_ascii=False)
+        atomic_write_json(progress_file, {'current_index': current_index})
     except Exception as e:
         print(f"警告：保存进度时出错: {e}")
 
@@ -139,6 +138,10 @@ def parse_args():
     parser.add_argument("--no-rag", action="store_true", help="禁用本地知识库检索")
     parser.add_argument("--knowledge-base", default=None, help="知识库目录，默认 knowledge_base/")
     parser.add_argument("--rag-top-k", type=int, default=6, help="RAG最多注入的资料片段数")
+    parser.add_argument("--offline-fixtures", default=None,
+                        help="从目录中的 <股票代码>.json 读取标准化数据，不访问行情API")
+    parser.add_argument("--state-dir", default=None,
+                        help="进度、失败记录和工作流缓存目录，默认 data/")
     return parser.parse_args()
 
 
@@ -155,10 +158,11 @@ def main():
     env_file = os.path.join(config_dir, '.env')
     load_dotenv(env_file)
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    settings = AppSettings.from_env()
+    api_key = settings.llm_api_key
     if not api_key and not args.dry_run:
-        print("错误：未找到DASHSCOPE_API_KEY，请检查config/.env文件")
-        return
+        print("错误：未找到 LLM_API_KEY 或 DASHSCOPE_API_KEY，请检查config/.env文件")
+        return 1
     if args.dry_run and not api_key:
         api_key = "dry-run"
 
@@ -175,17 +179,21 @@ def main():
         rag_enabled=not args.no_rag,
         rag_top_k=args.rag_top_k,
         dry_run=args.dry_run,
+        settings=settings,
+        offline_fixture_dir=args.offline_fixtures,
+        state_dir=args.state_dir,
     )
-    fetcher = StockDataFetcher()
 
     # 读取股票列表
     print("\n正在读取股票列表...")
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
-    stock_file = args.stock_file or os.path.join(data_dir, 'stocks_code.txt')
+    project_data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    data_dir = args.state_dir or project_data_dir
+    os.makedirs(data_dir, exist_ok=True)
+    stock_file = args.stock_file or os.path.join(project_data_dir, 'stocks_code.txt')
 
     if not os.path.exists(stock_file):
         print(f"错误：找不到股票列表文件 {stock_file}")
-        return
+        return 1
 
     with open(stock_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
@@ -194,12 +202,12 @@ def main():
     stock_list = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith('#')]
     if not stock_list:
         print("错误：股票列表为空，请在 data/stocks_code.txt 中添加6位股票代码")
-        return
+        return 1
 
     invalid_codes = [code for code in stock_list if not code.isdigit() or len(code) != 6]
     if invalid_codes:
         print(f"错误：股票代码格式无效: {', '.join(invalid_codes[:10])}")
-        return
+        return 1
 
     # 加载失败股票记录
     failed_stocks = load_failed_stocks(data_dir)
@@ -213,7 +221,7 @@ def main():
     if args.start_from:
         if args.start_from not in stock_list:
             print(f"错误：--start-from 指定的股票代码不在列表中: {args.start_from}")
-            return
+            return 1
         start_index = stock_list.index(args.start_from)
 
     if start_index > 0:
@@ -223,7 +231,7 @@ def main():
     if args.limit is not None:
         if args.limit <= 0:
             print("错误：--limit 必须大于0")
-            return
+            return 1
         end_index = min(start_index + args.limit, len(stock_list))
 
     # 获取已生成的文件
@@ -277,7 +285,15 @@ def main():
             print(f"\n[{i+1}/{len(stock_list)}] 正在生成 {stock_code} 的报告...")
 
             # 获取股票名称
-            stock_name = get_stock_name_improved(fetcher, stock_code)
+            if args.offline_fixtures:
+                fixture_path = os.path.join(args.offline_fixtures, f"{stock_code}.json")
+                try:
+                    with open(fixture_path, 'r', encoding='utf-8') as fixture_file:
+                        stock_name = json.load(fixture_file).get('stock_name', stock_code)
+                except (OSError, json.JSONDecodeError):
+                    stock_name = stock_code
+            else:
+                stock_name = generator.fetcher.get_stock_name(stock_code)
             print(f"  公司名称: {stock_name}")
 
             # 检查文件是否已存在
@@ -388,7 +404,10 @@ def main():
             print(f"  {code}: 失败{info['count']}次")
 
     print("\n提示：可重新运行程序继续生成失败的股票")
+    if should_exit:
+        return 130
+    return 1 if fail_count else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

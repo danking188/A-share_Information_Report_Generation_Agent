@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    defaults:
+      run:
+        working-directory: A股报告生成系统
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: A股报告生成系统/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q .
+      - name: Unit and offline integration tests
+        run: python -m unittest discover -s tests -v
+      - name: Offline CLI smoke test
+        run: >-
+          python batch_generate.py --dry-run --no-rag --limit 1
+          --stock-file tests/fixtures/stocks.txt
+          --offline-fixtures tests/fixtures
+          --output-dir .test-output
+          --state-dir .test-state
+      - name: Install Word rendering dependencies
+        if: matrix.python-version == '3.12'
+        run: sudo apt-get update && sudo apt-get install -y libreoffice fonts-noto-cjk poppler-utils
+      - name: Word to PDF rendering smoke test
+        if: matrix.python-version == '3.12'
+        run: |
+          libreoffice --headless --convert-to pdf --outdir .test-output .test-output/平安银行.docx
+          pdftotext .test-output/平安银行.pdf .test-output/report.txt
+          grep -q '平安银行' .test-output/report.txt

@@ -1,0 +1,53 @@
+{
+  "symbol": "000001",
+  "stock_name": "平安银行",
+  "company_full_name": "平安银行股份有限公司",
+  "industry": "银行",
+  "main_business": "商业银行业务",
+  "fetch_time": "2026-08-20 10:00:00",
+  "current_price": 12.5,
+  "market_cap": 242000000000,
+  "pe_ratio": 5.8,
+  "pb_ratio": 0.62,
+  "financial_summary": {
+    "latest_year": "2026年06月30日",
+    "report_date": "2026-06-30",
+    "revenue": 110000000000,
+    "net_profit": 25000000000
+  },
+  "historical_financial": {
+    "2026年06月": {
+      "report_date": "2026-06-30",
+      "period_type": "0630",
+      "revenue": 110000000000,
+      "net_profit": 25000000000,
+      "revenue_yoy": 10.0,
+      "net_profit_yoy": 25.0,
+      "previous_revenue": 100000000000,
+      "previous_net_profit": 20000000000,
+      "comparable_period": "2025年06月",
+      "roe": null
+    },
+    "2025年06月": {
+      "report_date": "2025-06-30",
+      "period_type": "0630",
+      "revenue": 100000000000,
+      "net_profit": 20000000000,
+      "revenue_yoy": null,
+      "net_profit_yoy": null,
+      "previous_revenue": null,
+      "previous_net_profit": null,
+      "comparable_period": null,
+      "roe": null
+    }
+  },
+  "key_metrics": {},
+  "valuation_metrics": {
+    "current_price": 12.5,
+    "pe_ratio": 5.8,
+    "pb_ratio": 0.62,
+    "market_cap": 242000000000
+  },
+  "industry_background": "银行",
+  "recent_news": "暂无最新新闻"
+}

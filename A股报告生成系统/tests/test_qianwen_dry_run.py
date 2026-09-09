@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import sys
 
@@ -34,6 +35,33 @@ class QianwenDryRunTest(unittest.TestCase):
         self.assertIn("financial_indicators", sections)
         self.assertIn("business_outlook", sections)
         self.assertIn("comparable_analysis", sections)
+
+    def test_reuses_cached_sections_and_reports_new_sections(self):
+        provider = Mock()
+        client = QianwenClient("key", provider=provider)
+        client.generate_investment_advice = Mock(side_effect=AssertionError("不应重新生成"))
+        client.generate_investment_logic = Mock(return_value="logic")
+        client.generate_company_overview_from_data = Mock(return_value="overview")
+        client.generate_financial_analysis = Mock(return_value="financial")
+        client.generate_business_outlook = Mock(return_value="outlook")
+        client.generate_comparable_analysis = Mock(return_value="comparable")
+        completed = []
+
+        report = client.generate_full_report(
+            {
+                "symbol": "000001",
+                "stock_name": "平安银行",
+                "industry": "银行",
+                "main_business": "商业银行业务",
+                "historical_financial": {},
+            },
+            existing_sections={"investment_advice": "cached advice"},
+            on_section=lambda key, content: completed.append(key),
+        )
+
+        self.assertEqual("cached advice", report["sections"]["investment_advice"])
+        self.assertNotIn("investment_advice", completed)
+        self.assertIn("investment_logic", completed)
 
 
 if __name__ == "__main__":

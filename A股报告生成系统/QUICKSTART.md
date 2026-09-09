@@ -14,10 +14,12 @@ pip install -r requirements.txt
 cp config/.env.example config/.env
 ```
 
-编辑 `config/.env`，填入 DashScope API Key：
+编辑 `config/.env`，填入模型配置：
 
 ```text
-DASHSCOPE_API_KEY=你的DashScope API Key
+LLM_PROVIDER=dashscope
+LLM_API_KEY=你的DashScope API Key
+LLM_MODEL=qwen-max
 ```
 
 ## 3. 准备股票列表
@@ -57,6 +59,18 @@ python src/main.py 000001
 python src/main.py 000001 --dry-run
 ```
 
+完全离线验证：
+
+```bash
+python batch_generate.py --dry-run --no-rag --limit 1 \
+  --stock-file tests/fixtures/stocks.txt \
+  --offline-fixtures tests/fixtures \
+  --output-dir .test-output \
+  --state-dir .test-state
+```
+
+`dry-run` 只跳过模型调用，默认仍会访问行情数据；配合 `--offline-fixtures` 才是完全离线运行。
+
 ## 输出位置
 
 批量生成的报告保存在：
@@ -78,6 +92,8 @@ output/
 
 - `data/progress.json`
 - `data/failed_stocks.json`
+- `data/workflow_states/`
+- `data/workflow_cache/`
 
 中断后重新运行，会继续处理后续股票。已生成的同名报告会自动跳过。
 

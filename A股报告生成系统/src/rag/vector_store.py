@@ -28,6 +28,7 @@ class LocalVectorStore:
         self.index_path = self.index_dir / "index.json"
         self.chunks: List[Dict] = []
         self.idf: Dict[str, float] = {}
+        self.source_fingerprint: List[Dict] = []
 
     def build(self, chunks: List[Dict]) -> None:
         self.chunks = []
@@ -58,6 +59,7 @@ class LocalVectorStore:
         payload = {
             "chunks": self.chunks,
             "idf": self.idf,
+            "source_fingerprint": self.source_fingerprint,
         }
         self.index_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -70,6 +72,7 @@ class LocalVectorStore:
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         self.chunks = payload.get("chunks", [])
         self.idf = payload.get("idf", {})
+        self.source_fingerprint = payload.get("source_fingerprint", [])
         return True
 
     def search(self, query: str, top_k: int = 6) -> List[Dict]:
@@ -84,6 +87,7 @@ class LocalVectorStore:
             if score > 0:
                 scored.append({
                     "score": round(score, 4),
+                    "chunk_id": chunk["id"],
                     "source": chunk["source"],
                     "text": chunk["text"],
                 })

@@ -7,7 +7,7 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from loguru import logger
 import time
 import gc
@@ -16,11 +16,31 @@ import gc
 class StockDataFetcher:
     """A股数据获取器"""
 
-    def __init__(self):
+    def __init__(self, max_retries: int = 2, retry_delay: float = 1.0):
         self.cache = {}
         self.cache_time = {}
         self.cache_duration = timedelta(hours=1)  # 缓存1小时
         self._cache_size_limit = 100  # 最大缓存数量
+        self.max_retries = max(1, max_retries)
+        self.retry_delay = max(0.0, retry_delay)
+
+    def _call_with_retry(self, operation: str, callback: Callable):
+        """Retry transient provider failures with bounded exponential backoff."""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return callback()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.max_retries - 1:
+                    break
+                delay = self.retry_delay * (2 ** attempt)
+                logger.warning(
+                    f"{operation}失败，将在{delay:.1f}秒后重试 "
+                    f"({attempt + 1}/{self.max_retries}): {exc}"
+                )
+                time.sleep(delay)
+        raise last_error
 
     def _is_cache_valid(self, key: str) -> bool:
         """检查缓存是否有效"""
@@ -88,7 +108,9 @@ class StockDataFetcher:
         try:
             logger.info("获取A股股票列表...")
             # 获取沪深A股列表
-            stock_list = ak.stock_info_a_code_name()
+            stock_list = self._call_with_retry(
+                "获取A股股票列表", ak.stock_info_a_code_name
+            )
             self._set_cache(cache_key, stock_list)
             logger.info(f"成功获取 {len(stock_list)} 只股票")
             return stock_list
@@ -105,7 +127,9 @@ class StockDataFetcher:
 
         try:
             logger.info("获取沪深A股实时行情列表...")
-            spot_data = ak.stock_zh_a_spot_em()
+            spot_data = self._call_with_retry(
+                "获取沪深A股实时行情", ak.stock_zh_a_spot_em
+            )
             if spot_data is not None and not spot_data.empty and '代码' in spot_data.columns:
                 spot_data = spot_data.copy()
                 spot_data['代码'] = spot_data['代码'].astype(str).str.zfill(6)
@@ -133,7 +157,10 @@ class StockDataFetcher:
 
         try:
             logger.info(f"获取股票 {symbol} 基本信息...")
-            info = ak.stock_individual_info_em(symbol=symbol)
+            info = self._call_with_retry(
+                f"获取股票{symbol}基本信息",
+                lambda: ak.stock_individual_info_em(symbol=symbol),
+            )
             if info is None or info.empty:
                 return {}
 
@@ -222,34 +249,26 @@ class StockDataFetcher:
             logger.info(f"获取股票 {symbol} 财务数据...")
             financial_data = {}
 
-            # 使用东方财富财务报表API（已验证可用）
-            try:
-                # 获取利润表
-                profit_sheet = ak.stock_financial_report_sina(stock=symbol, symbol="利润表")
-                if profit_sheet is not None and not profit_sheet.empty:
-                    financial_data['profit_sheet_sina'] = profit_sheet
-                    logger.info(f"获取利润表成功: {len(profit_sheet)} 行数据")
-                else:
-                    logger.warning("利润表数据为空")
-
-                # 获取资产负债表
-                balance_sheet = ak.stock_financial_report_sina(stock=symbol, symbol="资产负债表")
-                if balance_sheet is not None and not balance_sheet.empty:
-                    financial_data['balance_sheet_sina'] = balance_sheet
-                    logger.info(f"获取资产负债表成功: {len(balance_sheet)} 行数据")
-                else:
-                    logger.warning("资产负债表数据为空")
-
-                # 获取现金流量表
-                cash_flow = ak.stock_financial_report_sina(stock=symbol, symbol="现金流量表")
-                if cash_flow is not None and not cash_flow.empty:
-                    financial_data['cash_flow_sina'] = cash_flow
-                    logger.info(f"获取现金流量表成功: {len(cash_flow)} 行数据")
-                else:
-                    logger.warning("现金流量表数据为空")
-
-            except Exception as e:
-                logger.error(f"获取东方财富财务数据失败: {e}")
+            statements = {
+                'profit_sheet_sina': '利润表',
+                'balance_sheet_sina': '资产负债表',
+                'cash_flow_sina': '现金流量表',
+            }
+            for key, statement_name in statements.items():
+                try:
+                    statement = self._call_with_retry(
+                        f"获取{statement_name}",
+                        lambda name=statement_name: ak.stock_financial_report_sina(
+                            stock=symbol, symbol=name
+                        ),
+                    )
+                    if statement is not None and not statement.empty:
+                        financial_data[key] = statement
+                        logger.info(f"获取{statement_name}成功: {len(statement)} 行数据")
+                    else:
+                        logger.warning(f"{statement_name}数据为空")
+                except Exception as exc:
+                    logger.error(f"获取{statement_name}失败: {exc}")
 
             # 检查是否至少获取到一些数据
             if not financial_data:
@@ -406,8 +425,15 @@ class StockDataFetcher:
             if not stock_info.empty:
                 return stock_info.iloc[0]['name']
             return symbol
-        except:
-            return symbol
+        except Exception:
+            basic_info = self.get_stock_basic_info(symbol)
+            items = basic_info.get('individual_info', {}).get('items', {})
+            return str(
+                items.get('股票简称')
+                or items.get('名称')
+                or items.get('股票名称')
+                or symbol
+            )
 
 
 if __name__ == "__main__":

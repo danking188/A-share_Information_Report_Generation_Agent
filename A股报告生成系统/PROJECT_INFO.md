@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-本项目用于批量生成 A 股上市公司研究报告。流程包括：读取股票代码、通过 AkShare 获取基础数据和财务数据、调用 DashScope 千问生成分析文本，并输出 Word 文档。
+本项目用于批量生成 A 股上市公司研究报告。流程包括：读取股票代码、通过可替换的数据 Provider 获取基础与财务数据、按相同报告期计算同比、执行数据质量检查、检索本地资料、调用可替换的 LLM Provider 生成分析文本，并输出 Word 文档。
 
 当前版本适合按股票代码列表分批生成报告。实际生成质量取决于 AkShare 数据可用性、DashScope API 可用性，以及输入股票列表的完整程度。
 
@@ -15,6 +15,10 @@
 - `src/data_fetcher.py`：AkShare 数据获取和缓存
 - `src/qianwen_client.py`：DashScope 千问调用和报告章节生成
 - `src/report_generator.py`：Word 文档生成
+- `src/api_providers.py`：外部数据和模型 API 适配层
+- `src/settings.py`：环境变量配置
+- `src/data_quality.py`：数据质量门禁
+- `src/workflow_state.py`：阶段状态、缓存与原子写入
 
 ### 配置和数据
 
@@ -30,6 +34,8 @@
 - `knowledge_base/index/`：本地 RAG 检索索引，运行时自动生成
 - `data/progress.json`：批量生成进度，运行时自动生成
 - `data/failed_stocks.json`：失败记录，运行时自动生成
+- `data/workflow_states/`：每只股票的阶段状态
+- `data/workflow_cache/`：标准化数据与已完成章节缓存
 
 ## 快速开始
 
@@ -48,7 +54,9 @@ cp config/.env.example config/.env
 然后在 `config/.env` 中填写：
 
 ```text
-DASHSCOPE_API_KEY=你的DashScope API Key
+LLM_PROVIDER=dashscope
+LLM_API_KEY=你的DashScope API Key
+LLM_MODEL=qwen-max
 ```
 
 3. 编辑股票列表：
@@ -82,6 +90,8 @@ python batch_generate.py --dry-run --limit 1
 - 按股票名称、行业和主营业务检索相关片段
 - 将检索结果注入投资逻辑、公司概况、业务展望和可比分析的提示词
 
+检索资料会分配 `[S1]` 等证据编号，报告末尾保留实际注入的文件与片段编号。当前实现是轻量 TF-IDF 检索，不等同于 Embedding 向量数据库。
+
 可用参数：
 
 ```bash
@@ -112,6 +122,7 @@ python batch_generate.py --no-rag
 - 已生成的同名 `.docx` 文件会被跳过，便于断点续跑。
 - 单只股票连续失败达到 3 次后会跳过，并记录到 `data/failed_stocks.json`。
 - 中断程序后重新运行，会从 `data/progress.json` 记录的位置继续。
+- 单只股票会记录获取、清洗、检索、章节生成和 Word 导出五个阶段；失败后可复用已清洗数据和已生成章节。
 - 不建议同时运行多个实例，以免触发 API 限流或覆盖进度文件。
 
 常用参数：
@@ -121,6 +132,69 @@ python batch_generate.py --no-rag
 - `--retry-failed`：重新尝试失败 3 次以上的股票
 - `--output-dir PATH`：指定报告输出目录
 - `--dry-run`：不调用 DashScope API，仅验证流程和文档输出
+- `--offline-fixtures PATH`：读取标准化 JSON 样例，不访问行情 API
+- `--state-dir PATH`：指定状态、缓存和失败记录目录
+
+## 外部 API 配置
+
+### 模型接口
+
+默认使用 DashScope：
+
+```text
+LLM_PROVIDER=dashscope
+LLM_API_KEY=...
+LLM_MODEL=qwen-max
+LLM_TIMEOUT_SECONDS=60
+LLM_MAX_RETRIES=5
+```
+
+也可以接入任意 OpenAI Chat Completions 兼容接口：
+
+```text
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://your-llm-host.example/v1
+LLM_API_KEY=...
+LLM_MODEL=your-model
+```
+
+### 行情与财务接口
+
+默认使用 AkShare：
+
+```text
+MARKET_DATA_PROVIDER=akshare
+MARKET_DATA_MAX_RETRIES=2
+```
+
+公司内部或第三方 HTTP API：
+
+```text
+MARKET_DATA_PROVIDER=http_json
+MARKET_DATA_BASE_URL=https://data.example/api
+MARKET_DATA_API_KEY=...
+MARKET_DATA_COMPREHENSIVE_PATH=/stocks/{symbol}/comprehensive
+MARKET_DATA_NAME_PATH=/stocks/{symbol}/name
+```
+
+综合数据接口应返回标准化 JSON，至少包含：
+
+```json
+{
+  "symbol": "000001",
+  "basic_info": {},
+  "realtime_quote": {},
+  "financial_data": {
+    "profit_sheet_sina": [
+      {"报告日": 20260630, "营业收入": 1, "归属于母公司的净利润": 1}
+    ]
+  },
+  "industry_info": {},
+  "news": []
+}
+```
+
+数组会在适配层转换为 DataFrame。接入新供应商时，也可以实现 `MarketDataProvider` 或 `LLMProvider` 协议并在工厂函数中注册。
 
 ## 常见问题
 

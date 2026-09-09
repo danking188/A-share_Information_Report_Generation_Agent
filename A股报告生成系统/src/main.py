@@ -7,26 +7,36 @@ A股上市公司研究报告自动生成系统 - 主程序（优化版）
 import os
 import sys
 import argparse
+import json
 import pandas as pd
+from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 from typing import Dict, Optional
 import gc
 
 # 导入自定义模块
-from data_fetcher import StockDataFetcher
+from api_providers import MarketDataProvider, create_market_data_provider
+from data_quality import evaluate_data_quality
 from qianwen_client import QianwenClient
 from report_generator import ReportGenerator
 from rag import RAGRetriever
+from settings import AppSettings
+from workflow_state import WorkflowStateStore
 
 
 class ResearchReportGenerator:
     """研究报告生成器主类（内存优化版）"""
 
-    def __init__(self, api_key: str, auto_clean_interval: int = 10,
+    def __init__(self, api_key: str = "", auto_clean_interval: int = 10,
                  knowledge_base_dir: Optional[str] = None, rag_enabled: bool = True,
-                 rag_top_k: int = 6, dry_run: bool = False):
+                 rag_top_k: int = 6, dry_run: bool = False,
+                 settings: Optional[AppSettings] = None,
+                 data_provider: Optional[MarketDataProvider] = None,
+                 state_dir: Optional[str] = None,
+                 offline_fixture_dir: Optional[str] = None):
         """
         初始化生成器
 
@@ -34,9 +44,16 @@ class ResearchReportGenerator:
             api_key: 千问API密钥
             auto_clean_interval: 自动清理间隔（生成N份报告后清理）
         """
-        self.api_key = api_key
-        self.fetcher = StockDataFetcher()
-        self.qianwen_client = QianwenClient(api_key, dry_run=dry_run)
+        self.settings = settings or AppSettings.from_env()
+        if api_key and api_key != self.settings.llm_api_key:
+            self.settings = replace(self.settings, llm_api_key=api_key)
+        self.api_key = self.settings.llm_api_key
+        self.fetcher = data_provider or create_market_data_provider(self.settings)
+        self.qianwen_client = QianwenClient(
+            self.api_key,
+            dry_run=dry_run,
+            settings=self.settings,
+        )
         self.report_generator = None  # 延迟初始化，每次生成时创建新实例
 
         self.auto_clean_interval = auto_clean_interval
@@ -46,6 +63,10 @@ class ResearchReportGenerator:
         self.rag_top_k = rag_top_k
         self.project_dir = os.path.dirname(os.path.dirname(__file__))
         self.knowledge_base_dir = knowledge_base_dir or os.path.join(self.project_dir, 'knowledge_base')
+        self.offline_fixture_dir = Path(offline_fixture_dir) if offline_fixture_dir else None
+        self.state_store = WorkflowStateStore(
+            state_dir or os.path.join(self.project_dir, 'data')
+        )
         self.rag_retriever = None
 
         # 设置日志
@@ -71,7 +92,7 @@ class ResearchReportGenerator:
             log_file,
             rotation="10 MB",
             retention="30 days",
-            level="INFO",
+            level=self.settings.log_level,
             encoding="utf-8"
         )
 
@@ -141,7 +162,16 @@ class ResearchReportGenerator:
         logger.info("处理股票数据...")
 
         symbol = raw_data.get('symbol')
-        stock_name = self.fetcher.get_stock_name(symbol or '')
+        basic_info = raw_data.get('basic_info', {})
+        individual_items = self._extract_individual_items(basic_info)
+        stock_name = (
+            raw_data.get('stock_name')
+            or individual_items.get('股票简称')
+            or individual_items.get('名称')
+        )
+        # 自定义数据接口可以直接在综合数据响应中返回名称，避免额外请求。
+        if not stock_name:
+            stock_name = self.fetcher.get_stock_name(symbol or '')
         processed_data = {
             'symbol': symbol,
             'stock_name': stock_name,
@@ -149,8 +179,6 @@ class ResearchReportGenerator:
         }
 
         # 提取基本信息
-        basic_info = raw_data.get('basic_info', {})
-        individual_items = self._extract_individual_items(basic_info)
         processed_data['company_full_name'] = str(
             individual_items.get('股票简称') or individual_items.get('名称') or stock_name
         )
@@ -241,6 +269,7 @@ class ResearchReportGenerator:
     def _attach_rag_context(self, processed_data: Dict) -> Dict:
         """检索本地知识库并附加到报告数据中"""
         processed_data['rag_context'] = ''
+        processed_data['rag_sources'] = []
         if not self.rag_enabled or not self.rag_retriever:
             return processed_data
 
@@ -253,8 +282,19 @@ class ResearchReportGenerator:
         ]
         query = ' '.join(str(part) for part in query_parts if part)
         try:
-            context = self.rag_retriever.build_context(query, top_k=self.rag_top_k)
+            results = self.rag_retriever.search(query, top_k=self.rag_top_k)
+            context = self.rag_retriever.format_context(results)
             processed_data['rag_context'] = context
+            processed_data['rag_sources'] = [
+                {
+                    'evidence_id': item.get('evidence_id'),
+                    'source': item['source'],
+                    'chunk_id': item['chunk_id'],
+                    'score': item['score'],
+                }
+                for item in results
+                if item.get('evidence_id')
+            ]
             if context:
                 logger.info(f"RAG检索完成，注入资料长度: {len(context)} 字符")
             else:
@@ -277,20 +317,66 @@ class ResearchReportGenerator:
         except:
             return 'N/A'
 
+    @staticmethod
+    def _first_present(row: pd.Series, *columns):
+        for column in columns:
+            if column in row.index and pd.notna(row[column]):
+                return row[column]
+        return None
+
+    @staticmethod
+    def _parse_report_date(value) -> Optional[pd.Timestamp]:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if text.endswith('.0'):
+            text = text[:-2]
+        parsed = pd.to_datetime(text, format='%Y%m%d', errors='coerce')
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(text, errors='coerce')
+        return None if pd.isna(parsed) else parsed
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        if value is None or pd.isna(value):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _yoy(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+        if current is None or previous in (None, 0):
+            return None
+        return round((current - previous) / abs(previous) * 100, 2)
+
     def _extract_financial_summary(self, financial_data: Dict) -> Dict:
         """提取财务摘要"""
         summary = {}
 
-        # 优先从新浪利润表提取
         if 'profit_sheet_sina' in financial_data:
             profit_sheet = financial_data['profit_sheet_sina']
-            if profit_sheet is not None and not profit_sheet.empty and len(profit_sheet) > 0:
-                latest = profit_sheet.iloc[0]
-                summary['latest_year'] = latest.get('报告期', 'N/A')
-                summary['revenue'] = latest.get('营业总收入', latest.get('营业收入', 'N/A'))
-                summary['net_profit'] = latest.get('净利润', 'N/A')
-                logger.info(f"从新浪利润表提取数据: {summary['latest_year']}")
-                return summary
+            if profit_sheet is not None and not profit_sheet.empty:
+                dated_rows = []
+                for _, row in profit_sheet.iterrows():
+                    report_date = self._parse_report_date(
+                        self._first_present(row, '报告日', '报告期', '日期')
+                    )
+                    if report_date is not None:
+                        dated_rows.append((report_date, row))
+                if dated_rows:
+                    report_date, latest = max(dated_rows, key=lambda item: item[0])
+                    summary['latest_year'] = report_date.strftime('%Y年%m月%d日')
+                    summary['report_date'] = report_date.strftime('%Y-%m-%d')
+                    summary['revenue'] = self._first_present(
+                        latest, '营业收入', '营业总收入'
+                    )
+                    summary['net_profit'] = self._first_present(
+                        latest, '归属于母公司的净利润', '归属于上市公司股东的净利润', '净利润'
+                    )
+                    logger.info(f"从新浪利润表提取数据: {summary['latest_year']}")
+                    return summary
 
         # 备用：从旧利润表提取
         if 'profit_sheet' in financial_data:
@@ -318,64 +404,60 @@ class ResearchReportGenerator:
         return summary
 
     def _extract_historical_financial(self, financial_data: Dict) -> Dict:
-        """提取历史财务数据"""
+        """提取历史财务数据，并只计算相同报告期的同比。"""
         historical = {}
 
-        # 优先从新浪利润表提取（最近5年）
         if 'profit_sheet_sina' in financial_data:
             profit_sheet = financial_data['profit_sheet_sina']
-            if profit_sheet is not None and not profit_sheet.empty and len(profit_sheet) > 0:
-                # 最近5年数据（或更少如果数据不足）
-                num_rows = min(5, len(profit_sheet))
+            if profit_sheet is not None and not profit_sheet.empty:
+                records = []
+                for _, row in profit_sheet.iterrows():
+                    report_date = self._parse_report_date(
+                        self._first_present(row, '报告日', '报告期', '日期')
+                    )
+                    if report_date is None:
+                        continue
+                    records.append({
+                        'date': report_date,
+                        'revenue': self._safe_float(
+                            self._first_present(row, '营业收入', '营业总收入')
+                        ),
+                        'net_profit': self._safe_float(
+                            self._first_present(
+                                row,
+                                '归属于母公司的净利润',
+                                '归属于上市公司股东的净利润',
+                                '净利润',
+                            )
+                        ),
+                    })
 
-                # 直接使用iloc访问，避免iterrows的字符串匹配问题
-                for i in range(num_rows):
-                    # 获取报告期（第1列，索引为0）
-                    try:
-                        period_val = profit_sheet.iloc[i, 0]  # 使用iloc直接访问
-                        if pd.notna(period_val):
-                            # 将格式如 '20250930' 转换为 '2025年09月'
-                            period_str = str(int(period_val))  # 去掉前导零
-                            if len(period_str) == 8:
-                                year = period_str[:4]
-                                month = period_str[4:6]
-                                period = f'{year}年{month}月'
-                            else:
-                                period = period_str
-                        else:
-                            period = f'period_{i}'
-                    except Exception as e:
-                        logger.warning(f"获取报告期失败: {e}")
-                        period = f'period_{i}'
-
-                    # 提取营业收入（第2列，索引为1）
-                    revenue = None
-                    try:
-                        revenue = profit_sheet.iloc[i, 1]
-                        if not pd.notna(revenue):
-                            revenue = None
-                    except Exception as e:
-                        logger.warning(f"提取营业收入失败: {e}")
-                        revenue = None
-
-                    # 提取净利润（需要查找包含'净利润'的列）
-                    net_profit = None
-                    try:
-                        # 遍历所有列，找到包含'净利润'的列
-                        for col_idx, col_name in enumerate(profit_sheet.columns):
-                            if '净利润' in str(col_name):
-                                val = profit_sheet.iloc[i, col_idx]
-                                if pd.notna(val):
-                                    net_profit = val
-                                    break
-                    except Exception as e:
-                        logger.warning(f"提取净利润失败: {e}")
-                        net_profit = None
-
+                records.sort(key=lambda item: item['date'], reverse=True)
+                by_period = {
+                    (item['date'].year, item['date'].strftime('%m%d')): item
+                    for item in records
+                }
+                for item in records[:8]:
+                    report_date = item['date']
+                    previous = by_period.get((report_date.year - 1, report_date.strftime('%m%d')))
+                    period = report_date.strftime('%Y年%m月')
                     historical[period] = {
-                        'revenue': revenue,
-                        'net_profit': net_profit,
-                        'roe': None  # 利润表没有ROE
+                        'report_date': report_date.strftime('%Y-%m-%d'),
+                        'period_type': report_date.strftime('%m%d'),
+                        'revenue': item['revenue'],
+                        'net_profit': item['net_profit'],
+                        'revenue_yoy': self._yoy(
+                            item['revenue'], previous['revenue'] if previous else None
+                        ),
+                        'net_profit_yoy': self._yoy(
+                            item['net_profit'], previous['net_profit'] if previous else None
+                        ),
+                        'previous_revenue': previous['revenue'] if previous else None,
+                        'previous_net_profit': previous['net_profit'] if previous else None,
+                        'comparable_period': (
+                            previous['date'].strftime('%Y年%m月') if previous else None
+                        ),
+                        'roe': None,
                     }
                 logger.info(f"从新浪利润表提取到 {len(historical)} 期历史数据")
                 logger.info(f"期间名称: {list(historical.keys())}")
@@ -426,66 +508,114 @@ class ResearchReportGenerator:
             生成的报告文件路径
         """
         logger.info(f"开始生成股票 {stock_code} 的研究报告")
+        state = self.state_store.start(stock_code)
+        active_stage = "fetch_data"
 
         try:
-            # 1. 获取数据
-            logger.info("步骤 1/4: 获取股票数据...")
-            stock_data = self.fetcher.get_comprehensive_data(stock_code)
-
-            # 2. 处理数据
-            logger.info("步骤 2/4: 处理数据...")
-            processed_data = self._process_stock_data(stock_data)
-            processed_data = self._attach_rag_context(processed_data)
-
-            # 2.5. 验证关键数据是否存在
-            logger.info("步骤 2.5/4: 验证数据完整性...")
-            historical_financial = processed_data.get('historical_financial', {})
-            if not historical_financial or len(historical_financial) == 0:
-                logger.error(f"股票 {stock_code} 历史财务数据为空，无法生成有效报告")
-                logger.error("建议: 检查AkShare API是否正常，或尝试其他股票代码")
-                raise Exception(f"数据不足: 无法获取股票 {stock_code} 的历史财务数据，请检查数据源或更换股票")
+            processed_data = {}
+            processed_cache = self.state_store.load_artifact(stock_code, "processed_data")
+            if state.get("stages", {}).get("process_data") == "completed" and processed_cache:
+                processed_data = processed_cache
+                logger.info("复用已完成的数据清洗结果")
             else:
-                logger.info(f"数据验证通过: 获取到 {len(historical_financial)} 期历史财务数据")
+                logger.info("步骤 1/5: 获取股票数据...")
+                self.state_store.mark_stage(stock_code, "fetch_data", "running")
+                if self.offline_fixture_dir:
+                    fixture_path = self.offline_fixture_dir / f"{stock_code}.json"
+                    if not fixture_path.exists():
+                        raise FileNotFoundError(f"找不到离线样例: {fixture_path}")
+                    processed_data = json.loads(fixture_path.read_text(encoding="utf-8"))
+                    processed_data.setdefault("symbol", stock_code)
+                    self.state_store.mark_stage(
+                        stock_code, "fetch_data", "completed", str(fixture_path)
+                    )
+                else:
+                    stock_data = self.fetcher.get_comprehensive_data(stock_code)
+                    self.state_store.mark_stage(stock_code, "fetch_data", "completed")
+                    active_stage = "process_data"
+                    logger.info("步骤 2/5: 清洗并统一数据...")
+                    self.state_store.mark_stage(stock_code, "process_data", "running")
+                    processed_data = self._process_stock_data(stock_data)
 
-            # 3. AI生成报告内容
-            logger.info("步骤 3/4: 使用千问AI生成报告内容...")
-            report_content = self.qianwen_client.generate_full_report(processed_data)
+                artifact = self.state_store.save_artifact(
+                    stock_code, "processed_data", processed_data
+                )
+                self.state_store.mark_stage(
+                    stock_code, "process_data", "completed", artifact
+                )
 
-            # 4. 生成Word文档
-            logger.info("步骤 4/4: 生成Word文档...")
+            active_stage = "retrieve_context"
+            logger.info("步骤 3/5: 检索本地知识库...")
+            self.state_store.mark_stage(stock_code, active_stage, "running")
+            processed_data = self._attach_rag_context(processed_data)
+            quality = evaluate_data_quality(processed_data)
+            processed_data['data_quality'] = quality.to_dict()
+            artifact = self.state_store.save_artifact(
+                stock_code, "processed_data", processed_data
+            )
+            self.state_store.mark_stage(stock_code, active_stage, "completed", artifact)
 
-            # 合并数据（新结构不需要company_overview和appendix）
+            if not quality.can_generate:
+                raise ValueError("数据质量检查失败: " + "；".join(quality.critical_errors))
+            if quality.warnings:
+                logger.warning(
+                    f"数据质量降级（{quality.score}分）: " + "；".join(quality.warnings)
+                )
+            else:
+                logger.info(f"数据质量检查通过（{quality.score}分）")
+
+            active_stage = "generate_sections"
+            logger.info("步骤 4/5: 生成报告章节...")
+            self.state_store.mark_stage(stock_code, active_stage, "running")
+            section_cache = self.state_store.load_artifact(stock_code, "report_sections")
+
+            def save_section(section_key: str, content: str) -> None:
+                section_cache[section_key] = content
+                self.state_store.save_artifact(
+                    stock_code, "report_sections", section_cache
+                )
+
+            report_content = self.qianwen_client.generate_full_report(
+                processed_data,
+                existing_sections=section_cache,
+                on_section=save_section,
+            )
+            section_cache = report_content['sections']
+            section_artifact = self.state_store.save_artifact(
+                stock_code, "report_sections", section_cache
+            )
+            self.state_store.mark_stage(
+                stock_code, active_stage, "completed", section_artifact
+            )
+
+            active_stage = "export_docx"
+            logger.info("步骤 5/5: 生成Word文档...")
+            self.state_store.mark_stage(stock_code, active_stage, "running")
             final_report = {
                 'symbol': stock_code,
                 'stock_name': processed_data['stock_name'],
-                'sections': report_content['sections']
+                'sections': report_content['sections'],
+                'data_quality': quality.to_dict(),
+                'sources': processed_data.get('rag_sources', []),
             }
 
-            # 每次创建新的ReportGenerator实例，避免内存泄漏
             self.report_generator = ReportGenerator()
-            doc = self.report_generator.generate_full_report(final_report)
+            self.report_generator.generate_full_report(final_report)
 
-            # 保存文档
             if not output_path:
-                # 使用桌面上的A股调研报告文件夹
-                desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
-                output_dir = os.path.join(desktop_path, 'A股调研报告')
+                output_dir = os.path.join(self.project_dir, 'output')
                 os.makedirs(output_dir, exist_ok=True)
-
-                # 使用公司名称作为文件名（清理Windows非法字符）
                 stock_name = processed_data['stock_name']
-                # 移除Windows文件名非法字符
-                illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
-                for char in illegal_chars:
+                for char in ['<', '>', ':', '"', '/', '\\', '|', '?', '*']:
                     stock_name = stock_name.replace(char, '')
-                stock_name = stock_name.strip()
+                output_path = os.path.join(output_dir, f"{stock_name.strip()}.docx")
 
-                output_path = os.path.join(
-                    output_dir,
-                    f"{stock_name}.docx"
-                )
-
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             self.report_generator.save_report(output_path)
+            self.state_store.mark_stage(
+                stock_code, active_stage, "completed", output_path
+            )
+            self.state_store.complete(stock_code, output_path)
 
             # 清理ReportGenerator实例
             del self.report_generator
@@ -520,6 +650,7 @@ class ResearchReportGenerator:
             return output_path
 
         except Exception as e:
+            self.state_store.fail(stock_code, active_stage, e)
             logger.error(f"生成报告失败: {e}")
             raise
 
@@ -542,14 +673,18 @@ def main():
     parser.add_argument('--no-rag', action='store_true', help='禁用本地知识库检索')
     parser.add_argument('--knowledge-base', default=None, help='知识库目录，默认 knowledge_base/')
     parser.add_argument('--rag-top-k', type=int, default=6, help='RAG最多注入的资料片段数')
+    parser.add_argument('--offline-fixtures', default=None,
+                        help='从目录中的 <股票代码>.json 读取标准化数据，不访问行情API')
+    parser.add_argument('--state-dir', default=None,
+                        help='工作流状态和缓存目录，默认 data/')
 
     args = parser.parse_args()
 
-    # 获取API密钥
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    settings = AppSettings.from_env()
+    api_key = settings.llm_api_key
     if not api_key and not args.dry_run:
-        logger.error("错误: 未找到DASHSCOPE_API_KEY环境变量")
-        logger.error("请在config/.env文件中设置DASHSCOPE_API_KEY=your_api_key")
+        logger.error("错误: 未找到 LLM_API_KEY 或 DASHSCOPE_API_KEY 环境变量")
+        logger.error("请在config/.env文件中配置所选模型服务")
         sys.exit(1)
     if args.dry_run and not api_key:
         api_key = "dry-run"
@@ -562,6 +697,9 @@ def main():
         rag_enabled=not args.no_rag,
         rag_top_k=args.rag_top_k,
         dry_run=args.dry_run,
+        settings=settings,
+        offline_fixture_dir=args.offline_fixtures,
+        state_dir=args.state_dir,
     )
 
     try:

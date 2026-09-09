@@ -11,6 +11,7 @@ from docx.oxml.ns import qn
 from datetime import datetime
 from typing import Dict, List
 import os
+import platform
 from loguru import logger
 
 
@@ -19,21 +20,51 @@ class ReportGenerator:
 
     def __init__(self):
         self.document = Document()
+        if platform.system() == 'Darwin':
+            default_body_font = 'Songti SC'
+            default_heading_font = 'PingFang SC'
+        elif platform.system() == 'Windows':
+            default_body_font = 'Microsoft YaHei'
+            default_heading_font = 'Microsoft YaHei'
+        else:
+            default_body_font = 'Noto Sans CJK SC'
+            default_heading_font = 'Noto Sans CJK SC'
+        self.body_font = os.getenv('REPORT_BODY_FONT') or default_body_font
+        self.heading_font = os.getenv('REPORT_HEADING_FONT') or default_heading_font
         self._setup_styles()
+
+    def _set_run_font(self, run, font_name: str, size: Pt = None):
+        run.font.name = font_name
+        if size is not None:
+            run.font.size = size
+        fonts = run._element.get_or_add_rPr().get_or_add_rFonts()
+        fonts.set(qn('w:ascii'), font_name)
+        fonts.set(qn('w:hAnsi'), font_name)
+        fonts.set(qn('w:eastAsia'), font_name)
 
     def _setup_styles(self):
         """设置文档样式"""
         try:
             # 设置默认字体
-            self.document.styles['Normal'].font.name = '宋体'
-            self.document.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+            self.document.styles['Normal'].font.name = self.body_font
+            self.document.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), self.body_font)
             self.document.styles['Normal'].font.size = Pt(10.5)
+
+            title_style = self.document.styles['Title']
+            title_style.font.name = self.heading_font
+            title_style.font.color.rgb = RGBColor(0, 0, 0)
+            title_style._element.rPr.rFonts.set(qn('w:eastAsia'), self.heading_font)
+            title_ppr = title_style._element.get_or_add_pPr()
+            title_border = title_ppr.find(qn('w:pBdr'))
+            if title_border is not None:
+                title_ppr.remove(title_border)
 
             # 修改现有标题样式（紧凑版）
             for i in range(1, 4):
                 try:
                     heading_style = self.document.styles[f'Heading {i}']
-                    heading_style.font.name = '黑体'
+                    heading_style.font.name = self.heading_font
+                    heading_style._element.rPr.rFonts.set(qn('w:eastAsia'), self.heading_font)
                     heading_style.font.size = Pt(14 - i * 1)  # 更紧凑的字体大小
                     heading_style.font.bold = True
                     heading_style.font.color.rgb = RGBColor(0, 0, 0)
@@ -44,7 +75,8 @@ class ReportGenerator:
                         f'Heading {i}',
                         WD_STYLE_TYPE.PARAGRAPH
                     )
-                    heading_style.font.name = '黑体'
+                    heading_style.font.name = self.heading_font
+                    heading_style._element.rPr.rFonts.set(qn('w:eastAsia'), self.heading_font)
                     heading_style.font.size = Pt(14 - i * 1)
                     heading_style.font.bold = True
                     heading_style.font.color.rgb = RGBColor(0, 0, 0)
@@ -64,8 +96,7 @@ class ReportGenerator:
         """添加段落"""
         paragraph = self.document.add_paragraph()
         run = paragraph.add_run(text)
-        run.font.name = '宋体'
-        run.font.size = font_size or Pt(10.5)
+        self._set_run_font(run, self.body_font, font_size or Pt(10.5))
         run.font.bold = True if bold else False
         run.font.color.rgb = RGBColor(0, 0, 0)
 
@@ -105,8 +136,7 @@ class ReportGenerator:
                 for paragraph in cell.paragraphs:
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     for run in paragraph.runs:
-                        run.font.name = '宋体'
-                        run.font.size = Pt(9)
+                        self._set_run_font(run, self.body_font, Pt(9))
 
         if headers and len(headers) == cols:
             header_row = table.rows[0]
@@ -127,19 +157,17 @@ class ReportGenerator:
     def add_report_title(self, stock_name: str, stock_code: str):
         """添加报告标题（替代封面页）"""
         # 标题
-        title = self.document.add_heading()
+        title = self.document.add_paragraph(style='Title')
         title.alignment = WD_ALIGN_PARAGRAPH.LEFT
         title_run = title.add_run(f'{stock_name}（{stock_code}）研究报告')
-        title_run.font.name = '黑体'
-        title_run.font.size = Pt(16)
+        self._set_run_font(title_run, self.heading_font, Pt(16))
         title_run.font.bold = True
-        title_run.font.color.rgb = RGBColor(0, 51, 102)
+        title_run.font.color.rgb = RGBColor(0, 0, 0)
 
         # 日期
         date_paragraph = self.document.add_paragraph()
         date_run = date_paragraph.add_run(f'报告日期：{datetime.now().strftime("%Y年%m月%d日")}')
-        date_run.font.name = '宋体'
-        date_run.font.size = Pt(10)
+        self._set_run_font(date_run, self.body_font, Pt(10))
         date_run.font.color.rgb = RGBColor(128, 128, 128)
 
         self.document.add_paragraph()  # 空行
@@ -172,6 +200,16 @@ class ReportGenerator:
 
             # 1. 添加标题（替代封面页）
             self.add_report_title(stock_name, stock_code)
+
+            quality = report_data.get('data_quality') or {}
+            if quality:
+                status_labels = {'passed': '完整', 'degraded': '部分缺失', 'failed': '不合格'}
+                status = status_labels.get(quality.get('status'), quality.get('status', '未知'))
+                warnings = quality.get('warnings') or []
+                quality_text = f"数据状态：{status}（质量评分：{quality.get('score', 'N/A')}）"
+                if warnings:
+                    quality_text += "；" + "；".join(warnings)
+                self._add_paragraph(quality_text, font_size=Pt(9))
 
             # 获取sections
             sections = report_data.get('sections', {})
@@ -219,6 +257,21 @@ class ReportGenerator:
                 self._add_title('三、可比上市公司对比', level=1)
                 self._add_paragraph(sections['comparable_analysis'], indent=True)
                 self.document.add_paragraph()
+
+            sources = report_data.get('sources') or []
+            if sources:
+                self._add_title('资料来源', level=1)
+                seen = set()
+                for source in sources:
+                    key = (source.get('evidence_id'), source.get('source'))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self._add_paragraph(
+                        f"[{source.get('evidence_id')}] {source.get('source')} "
+                        f"（片段：{source.get('chunk_id')}）",
+                        font_size=Pt(9),
+                    )
 
             logger.info("Word文档生成完成！")
             return self.document
